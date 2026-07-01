@@ -3,7 +3,6 @@
 
 import socket
 import json
-import sys
 
 import pygame
 
@@ -13,22 +12,24 @@ from game  import run_game
 
 
 def main():
-    # 1) 顯示大廳，讓玩家選 Server IP / ID / 造型 / 顏色
+    # 1) 大廳
     config = show_lobby()
     if config is None:
         pygame.quit()
         return
 
-    # 2) 連線
+    # 2) 連線（TCP_NODELAY 降低延遲、SO_KEEPALIVE 偵測斷線）
     sock = socket.socket()
     try:
         sock.connect((config["ip"], PORT))
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError as e:
         print(f"連線失敗：{e}")
         pygame.quit()
         return
 
-    # 3) 送出 join 訊息 → 進入遊戲
+    # 3) 送出 join
     join = {
         "type":  "join",
         "id":    config["id"],
@@ -43,7 +44,7 @@ def main():
         sock.close()
         return
 
-    # 4) 主遊戲迴圈
+    # 4) 進入遊戲
     try:
         run_game(sock, config)
     finally:

@@ -1,5 +1,6 @@
 # 多人小遊戲 - 伺服器端
-# 責任：管理玩家 / 子彈 / 補血道具的狀態，30Hz 廣播給所有 client
+# 責任：管理玩家 / 子彈 / 道具 / Buff / 聊天記錄，30Hz 廣播給所有 client
+# 穩定性：每個 client 有獨立發送 queue，慢的 client 不會拖累其他人
 
 import socket
 import threading
@@ -7,43 +8,164 @@ import json
 import time
 import math
 import random
+import queue
+import collections
 
 from constants import (
     PORT, WORLD_W, WORLD_H, TICK_HZ,
-    MAX_HP, BULLET_SPEED, BULLET_LIFETIME, BULLET_RADIUS, BULLET_DAMAGE,
-    PLAYER_SIZE, PICKUP_HEAL, PICKUP_RADIUS, PICKUP_MAX, PICKUP_SPAWN_INTERVAL,
+    MAX_HP, PLAYER_SIZE,
+    BULLET_SPEED, BULLET_LIFETIME, BULLET_RADIUS, BULLET_DAMAGE,
+    SHOOT_COOLDOWN, SHOOT_COOLDOWN_RAPID,
+    PICKUP_HEAL, PICKUP_RADIUS, PICKUP_MAX, PICKUP_SPAWN_INTERVAL,
+    PICKUP_TYPES, PICKUP_WEIGHTS,
+    HP_SIZE_BONUS, MAX_SIZE_BONUS,
+    BUFF_DURATION,
+    ORBIT_COUNT, ORBIT_RADIUS, ORBIT_ANGULAR_SPEED,
+    ORBIT_HIT_DAMAGE, ORBIT_HIT_CD, ORBIT_BULLET_RADIUS,
+    HOMING_TURN_RATE, HOMING_RANGE,
+    CHAT_LOG_MAX,
 )
 
 HOST = "0.0.0.0"
 
 # ====== 共享狀態 ======
-players = {}   # {cid: {"id","x","y","shape","color","hp","alive","chat","chat_time"}}
-bullets = []   # [{"id","owner","x","y","vx","vy","t"}]
-pickups = []   # [{"id","x","y"}]
-conns   = []   # [(socket, cid)]
-lock    = threading.Lock()
+players = {}   # {cid: player_dict}
+bullets = []
+pickups = []
+chat_log = collections.deque(maxlen=CHAT_LOG_MAX)
+lock = threading.Lock()
 
 bullet_id_counter = 0
 pickup_id_counter = 0
+
+# (attacker_cid, victim_cid) -> next_hit_ts
+orbit_hit_cd = {}
+
+
+class ClientConn:
+    """每個 client 一個發送 queue + 發送 thread，慢的 client 不會阻塞廣播"""
+    __slots__ = ("conn", "cid", "q", "alive")
+
+    def __init__(self, conn, cid):
+        self.conn = conn
+        self.cid = cid
+        self.q = queue.Queue(maxsize=8)
+        self.alive = True
+
+    def send(self, msg_bytes):
+        try:
+            self.q.put_nowait(msg_bytes)
+        except queue.Full:
+            # 慢客戶端：丟掉最舊的一筆，塞入最新
+            try:
+                self.q.get_nowait()
+                self.q.put_nowait(msg_bytes)
+            except queue.Empty:
+                pass
+
+    def sender_loop(self):
+        while self.alive:
+            msg = self.q.get()
+            if msg is None:
+                return
+            try:
+                self.conn.sendall(msg)
+            except OSError:
+                self.alive = False
+                return
+
+    def close(self):
+        self.alive = False
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
+conns_by_cid = {}   # {cid: ClientConn}
 
 
 def 隨機重生點():
     return random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200)
 
 
+def 取得射擊冷卻(p, now):
+    return SHOOT_COOLDOWN_RAPID if now < p["buffs"].get("rapid", 0) else SHOOT_COOLDOWN
+
+
+def 套用道具(p, ptype, now):
+    if ptype == "hp":
+        p["hp"] = min(MAX_HP, p["hp"] + PICKUP_HEAL)
+        p["size_bonus"] = min(MAX_SIZE_BONUS, p["size_bonus"] + HP_SIZE_BONUS)
+    else:
+        p["buffs"][ptype] = now + BUFF_DURATION
+
+
+def 玩家半徑(p):
+    return PLAYER_SIZE + p.get("size_bonus", 0)
+
+
+def 打包玩家(p, now):
+    remaining = {k: max(0.0, v - now) for k, v in p.get("buffs", {}).items() if v > now}
+    return {
+        "id":         p["id"],
+        "x":          p["x"],
+        "y":          p["y"],
+        "shape":      p["shape"],
+        "color":      p["color"],
+        "hp":         p["hp"],
+        "alive":      p["alive"],
+        "size_bonus": p.get("size_bonus", 0),
+        "chat":       p.get("chat", ""),
+        "chat_time":  p.get("chat_time", 0),
+        "buffs":      remaining,
+    }
+
+
 def 遊戲Tick():
-    """每 1/TICK_HZ 秒：移動子彈、處理碰撞、生成補血、廣播狀態"""
     global bullet_id_counter, pickup_id_counter
     last = time.time()
     last_pickup_spawn = 0
 
     while True:
         now = time.time()
-        dt = now - last
+        dt = min(now - last, 0.1)  # 卡頓時不讓 dt 爆掉
         last = now
 
         with lock:
-            # 1) 子彈移動 / 消失 / 命中
+            # === 1) 追蹤子彈：轉向最近敵人 ===
+            for b in bullets:
+                if not b.get("homing"):
+                    continue
+                best = None
+                best_d2 = HOMING_RANGE * HOMING_RANGE
+                for cid, p in players.items():
+                    if cid == b["owner"] or not p["alive"]:
+                        continue
+                    dx = p["x"] - b["x"]
+                    dy = p["y"] - b["y"]
+                    d2 = dx * dx + dy * dy
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = (dx, dy, math.sqrt(d2))
+                if best:
+                    dx, dy, d = best
+                    tx, ty = dx / d, dy / d
+                    speed = math.hypot(b["vx"], b["vy"])
+                    if speed > 0:
+                        cx, cy = b["vx"] / speed, b["vy"] / speed
+                        cross = cx * ty - cy * tx  # >0 → 目標在左方，轉向逆時針
+                        turn = HOMING_TURN_RATE * dt
+                        turn = -turn if cross < 0 else turn
+                        c, s = math.cos(turn), math.sin(turn)
+                        b["vx"] = (cx * c - cy * s) * speed
+                        b["vy"] = (cx * s + cy * c) * speed
+
+            # === 2) 子彈移動 + 命中 ===
             for b in list(bullets):
                 if now - b["t"] > BULLET_LIFETIME:
                     bullets.remove(b)
@@ -53,13 +175,13 @@ def 遊戲Tick():
                 if b["x"] < 0 or b["x"] > WORLD_W or b["y"] < 0 or b["y"] > WORLD_H:
                     bullets.remove(b)
                     continue
-                # 命中判定：跳過自己 & 已死玩家
                 for cid, p in players.items():
-                    if cid == b["owner"] or not p.get("alive", True):
+                    if cid == b["owner"] or not p["alive"]:
                         continue
                     dx = p["x"] - b["x"]
                     dy = p["y"] - b["y"]
-                    if dx * dx + dy * dy < (PLAYER_SIZE + BULLET_RADIUS) ** 2:
+                    hitr = 玩家半徑(p) + BULLET_RADIUS
+                    if dx * dx + dy * dy < hitr * hitr:
                         p["hp"] -= BULLET_DAMAGE
                         if p["hp"] <= 0:
                             p["hp"] = 0
@@ -67,53 +189,77 @@ def 遊戲Tick():
                         bullets.remove(b)
                         break
 
-            # 2) 補血道具：定時補位到上限
+            # === 3) 軌道子彈（不存清單，每 tick 依角度即時算） ===
+            orbit_snapshot = []
+            for cid, p in players.items():
+                if not p["alive"] or now >= p["buffs"].get("orbit", 0):
+                    continue
+                for i in range(ORBIT_COUNT):
+                    ang = now * ORBIT_ANGULAR_SPEED + i * 2 * math.pi / ORBIT_COUNT
+                    ox = p["x"] + math.cos(ang) * ORBIT_RADIUS
+                    oy = p["y"] + math.sin(ang) * ORBIT_RADIUS
+                    orbit_snapshot.append({
+                        "owner_id": p["id"],
+                        "color":    p["color"],
+                        "x": ox, "y": oy,
+                    })
+                    # 命中判定
+                    for vcid, vp in players.items():
+                        if vcid == cid or not vp["alive"]:
+                            continue
+                        dx = vp["x"] - ox
+                        dy = vp["y"] - oy
+                        hitr = 玩家半徑(vp) + ORBIT_BULLET_RADIUS
+                        if dx * dx + dy * dy < hitr * hitr:
+                            key = (cid, vcid)
+                            if orbit_hit_cd.get(key, 0) < now:
+                                vp["hp"] -= ORBIT_HIT_DAMAGE
+                                if vp["hp"] <= 0:
+                                    vp["hp"] = 0
+                                    vp["alive"] = False
+                                orbit_hit_cd[key] = now + ORBIT_HIT_CD
+
+            # === 4) 生成道具 ===
             if now - last_pickup_spawn > PICKUP_SPAWN_INTERVAL and len(pickups) < PICKUP_MAX:
                 pickup_id_counter += 1
+                ptype = random.choices(PICKUP_TYPES, weights=PICKUP_WEIGHTS, k=1)[0]
                 pickups.append({
-                    "id": pickup_id_counter,
-                    "x": random.randint(80, WORLD_W - 80),
-                    "y": random.randint(80, WORLD_H - 80),
+                    "id":   pickup_id_counter,
+                    "type": ptype,
+                    "x":    random.randint(80, WORLD_W - 80),
+                    "y":    random.randint(80, WORLD_H - 80),
                 })
                 last_pickup_spawn = now
 
-            # 3) 玩家撿補血
+            # === 5) 玩家撿道具 ===
             for p in players.values():
-                if not p.get("alive", True):
+                if not p["alive"]:
                     continue
                 for pk in list(pickups):
                     dx = p["x"] - pk["x"]
                     dy = p["y"] - pk["y"]
-                    if dx * dx + dy * dy < (PLAYER_SIZE + PICKUP_RADIUS) ** 2:
-                        p["hp"] = min(MAX_HP, p["hp"] + PICKUP_HEAL)
+                    hitr = 玩家半徑(p) + PICKUP_RADIUS
+                    if dx * dx + dy * dy < hitr * hitr:
+                        套用道具(p, pk["type"], now)
                         pickups.remove(pk)
 
-            # 4) 整包狀態
+            # === 6) 打包狀態 ===
             state = {
-                "type": "state",
-                "players": list(players.values()),
-                "bullets": [{"x": b["x"], "y": b["y"]} for b in bullets],
-                "pickups": [{"x": pk["x"], "y": pk["y"]} for pk in pickups],
+                "type":     "state",
+                "players":  [打包玩家(p, now) for p in players.values()],
+                "bullets":  [{"x": b["x"], "y": b["y"], "homing": b.get("homing", False)} for b in bullets],
+                "orbits":   orbit_snapshot,
+                "pickups":  [{"x": pk["x"], "y": pk["y"], "type": pk["type"]} for pk in pickups],
+                "chat_log": list(chat_log),
+                "now":      now,
             }
+            client_list = list(conns_by_cid.values())
 
-        # 廣播
-        msg = (json.dumps(state) + "\n").encode("utf-8")
-        dead = []
-        for conn, cid in list(conns):
-            try:
-                conn.sendall(msg)
-            except OSError:
-                dead.append((conn, cid))
-        if dead:
-            with lock:
-                for conn, cid in dead:
-                    if (conn, cid) in conns:
-                        conns.remove((conn, cid))
-                    players.pop(cid, None)
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+        # === 7) 廣播（每個 client 自己的 queue，非同步） ===
+        payload = (json.dumps(state) + "\n").encode("utf-8")
+        for c in client_list:
+            if c.alive:
+                c.send(payload)
 
         time.sleep(1 / TICK_HZ)
 
@@ -121,11 +267,18 @@ def 遊戲Tick():
 def 處理單一連線(conn, cid, addr):
     global bullet_id_counter
     print(f"[{cid}] {addr} 已連線")
-    conns.append((conn, cid))
+    cc = ClientConn(conn, cid)
+    conns_by_cid[cid] = cc
+    sender_thread = threading.Thread(target=cc.sender_loop, daemon=True)
+    sender_thread.start()
+
     buf = b""
     try:
         while True:
-            data = conn.recv(4096)
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                break
             if not data:
                 break
             buf += data
@@ -137,58 +290,70 @@ def 處理單一連線(conn, cid, addr):
                     continue
 
                 t = msg.get("type")
+                now = time.time()
                 with lock:
                     if t == "join":
                         x, y = 隨機重生點()
                         players[cid] = {
-                            "id":    str(msg.get("id", f"P{cid}"))[:12],
-                            "shape": msg.get("shape", "circle"),
-                            "color": msg.get("color", [200, 50, 50]),
+                            "id":         str(msg.get("id", f"P{cid}"))[:12],
+                            "shape":      msg.get("shape", "circle"),
+                            "color":      msg.get("color", [200, 50, 50]),
                             "x": x, "y": y,
-                            "hp":    MAX_HP,
-                            "alive": True,
+                            "hp":         MAX_HP,
+                            "alive":      True,
+                            "size_bonus": 0,
+                            "buffs":      {},
                             "chat": "", "chat_time": 0,
+                            "shoot_cd_end": 0,
                         }
                         print(f"[{cid}] 加入為 {players[cid]['id']}")
 
-                    elif t == "update" and cid in players and players[cid].get("alive", True):
+                    elif t == "update" and cid in players and players[cid]["alive"]:
                         players[cid]["x"] = max(0, min(WORLD_W, float(msg.get("x", 0))))
                         players[cid]["y"] = max(0, min(WORLD_H, float(msg.get("y", 0))))
 
-                    elif t == "shoot" and cid in players and players[cid].get("alive", True):
-                        dx = float(msg.get("dx", 0))
-                        dy = float(msg.get("dy", 0))
-                        d = math.sqrt(dx * dx + dy * dy)
-                        if d > 0:
-                            bullet_id_counter += 1
-                            bullets.append({
-                                "id":    bullet_id_counter,
-                                "owner": cid,
-                                "x":     players[cid]["x"],
-                                "y":     players[cid]["y"],
-                                "vx":    dx / d * BULLET_SPEED,
-                                "vy":    dy / d * BULLET_SPEED,
-                                "t":     time.time(),
-                            })
+                    elif t == "shoot" and cid in players and players[cid]["alive"]:
+                        p = players[cid]
+                        if now >= p["shoot_cd_end"]:
+                            dx = float(msg.get("dx", 0))
+                            dy = float(msg.get("dy", 0))
+                            d = math.hypot(dx, dy)
+                            if d > 0:
+                                p["shoot_cd_end"] = now + 取得射擊冷卻(p, now)
+                                bullet_id_counter += 1
+                                bullets.append({
+                                    "id":     bullet_id_counter,
+                                    "owner":  cid,
+                                    "x":      p["x"],
+                                    "y":      p["y"],
+                                    "vx":     dx / d * BULLET_SPEED,
+                                    "vy":     dy / d * BULLET_SPEED,
+                                    "t":      now,
+                                    "homing": now < p["buffs"].get("homing", 0),
+                                })
 
                     elif t == "chat" and cid in players:
-                        players[cid]["chat"]      = str(msg.get("text", ""))[:80]
-                        players[cid]["chat_time"] = time.time()
+                        p = players[cid]
+                        txt = str(msg.get("text", ""))[:80].strip()
+                        if txt:
+                            p["chat"] = txt
+                            p["chat_time"] = now
+                            chat_log.append({"author": p["id"], "text": txt, "ts": now})
 
                     elif t == "respawn" and cid in players:
                         x, y = 隨機重生點()
-                        players[cid]["hp"]    = MAX_HP
-                        players[cid]["alive"] = True
-                        players[cid]["x"]     = x
-                        players[cid]["y"]     = y
+                        p = players[cid]
+                        p["hp"] = MAX_HP
+                        p["alive"] = True
+                        p["x"] = x
+                        p["y"] = y
+                        p["size_bonus"] = 0
+                        p["buffs"].clear()
     finally:
         with lock:
             players.pop(cid, None)
-            conns[:] = [(c, i) for c, i in conns if i != cid]
-        try:
-            conn.close()
-        except OSError:
-            pass
+            cc.close()
+            conns_by_cid.pop(cid, None)
         print(f"[{cid}] 中斷連線")
 
 
@@ -197,7 +362,7 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
     s.listen()
-    print(f"Server 開啟於 {HOST}:{PORT}(Ctrl+C 停止)")
+    print(f"Server 開啟於 {HOST}:{PORT}  (Ctrl+C 停止)")
 
     threading.Thread(target=遊戲Tick, daemon=True).start()
 
@@ -205,6 +370,12 @@ def main():
     try:
         while True:
             conn, addr = s.accept()
+            # 提高即時性 + 偵測斷線
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
             cid_counter += 1
             threading.Thread(
                 target=處理單一連線,
